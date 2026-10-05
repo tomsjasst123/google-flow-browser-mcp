@@ -6,6 +6,10 @@ import { logger } from '../utils/logger.js';
 import { get } from '../utils/config.js';
 import { FlowError, ErrorCodes } from '../utils/errors.js';
 import { takeScreenshot } from '../utils/screenshots.js';
+import {
+  findChromePath, getUserDataDir, getProfileName, getProfileSource,
+  getProfileMode, getPersistentProfileDir, makeTempProfileDir,
+} from './chrome-paths.js';
 
 let browser = null;
 let context = null;
@@ -46,8 +50,8 @@ export async function connectToBrowser(options = {}) {
 }
 
 async function launchNewBrowser(cdpPort, options = {}) {
-  const chromePath = options.chromePath || '/opt/google/chrome/chrome';
-  const profileDir = options.profileDir || path.resolve(import.meta.dirname, '../../chrome-profile-kiara');
+  const chromePath = options.chromePath || findChromePath();
+  const profileDir = options.profileDir || getPersistentProfileDir();
 
   if (!fs.existsSync(chromePath)) {
     throw new FlowError(ErrorCodes.PLAYWRIGHT_ERROR, `Chrome not found at ${chromePath}`);
@@ -96,38 +100,54 @@ async function launchNewBrowser(cdpPort, options = {}) {
 
 /**
  * Launch Chrome DIRECTLY (not via Playwright) to avoid automation detection
- * (navigator.webdriver=false). Creates temp user-data-dir with Profile 3 cookies,
- * launches Chrome via shell, then connects Playwright via CDP.
+ * (navigator.webdriver=false), then connect Playwright via CDP.
+ *
+ * In "copy" mode the configured profile is copied into a temp user-data-dir
+ * (removed on disconnect). In "persistent" mode a dedicated user-data-dir in
+ * the project is used as-is, so a one-time sign-in survives restarts.
  */
 export async function launchChromeDirect(options = {}) {
-  const chromePath = options.chromePath || '/opt/google/chrome/chrome';
+  const chromePath = options.chromePath || findChromePath();
   const cdpPort = options.cdpPort || get('cdpPort', 9222);
   const headless = options.headless ?? get('headless', false);
-  const profileSource = options.profileSource || path.resolve(process.env.HOME, '.config/google-chrome/Profile 3');
+  const mode = options.profileMode || getProfileMode();
 
   if (isConnected && page) {
     logger.info('Already connected, reusing browser');
     return { browser, context, page };
   }
 
-  if (!fs.existsSync(chromePath)) {
-    throw new FlowError(ErrorCodes.PLAYWRIGHT_ERROR, `Chrome not found at ${chromePath}`);
+  if (!chromePath || !fs.existsSync(chromePath)) {
+    throw new FlowError(ErrorCodes.PLAYWRIGHT_ERROR,
+      `Chrome not found at ${chromePath}. Set "chromePath" in config/flow.config.json.`);
   }
 
-  const tempDir = `/tmp/chrome-kiara-cdp-${Date.now()}`;
-  fs.mkdirSync(tempDir, { recursive: true });
+  let userDataDir;
+  let profileName;
 
-  const localStateSrc = path.resolve(path.dirname(profileSource), '../Local State');
-  if (fs.existsSync(profileSource)) {
-    fs.cpSync(profileSource, path.join(tempDir, 'Profile 3'), { recursive: true });
-  }
-  if (fs.existsSync(localStateSrc)) {
-    fs.cpSync(localStateSrc, path.join(tempDir, 'Local State'));
+  if (mode === 'persistent') {
+    userDataDir = getPersistentProfileDir();
+    profileName = 'Default';
+    fs.mkdirSync(userDataDir, { recursive: true });
+    logger.info('Using persistent automation profile', { userDataDir });
   } else {
-    fs.writeFileSync(path.join(tempDir, 'Local State'), JSON.stringify({ profile: { info_cache: {} } }));
-  }
+    const profileSource = options.profileSource || getProfileSource();
+    profileName = getProfileName();
+    userDataDir = makeTempProfileDir();
 
-  logger.info('Temp profile created with cookies', { tempDir });
+    const localStateSrc = path.join(getUserDataDir(), 'Local State');
+    if (fs.existsSync(profileSource)) {
+      fs.cpSync(profileSource, path.join(userDataDir, profileName), { recursive: true });
+    }
+    if (fs.existsSync(localStateSrc)) {
+      fs.cpSync(localStateSrc, path.join(userDataDir, 'Local State'));
+    } else {
+      fs.writeFileSync(path.join(userDataDir, 'Local State'), JSON.stringify({ profile: { info_cache: {} } }));
+    }
+
+    global.__chromeTempDir = userDataDir;
+    logger.info('Temp profile created with cookies', { userDataDir, profileName });
+  }
 
   try {
     const existing = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
@@ -137,17 +157,18 @@ export async function launchChromeDirect(options = {}) {
 
   const args = [
     `--remote-debugging-port=${cdpPort}`,
-    `--user-data-dir=${tempDir}`,
-    '--profile-directory=Profile 3',
+    `--user-data-dir=${userDataDir}`,
+    `--profile-directory=${profileName}`,
     '--no-first-run', '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
     '--window-size=1920,1080',
   ];
   if (headless) args.push('--headless=new');
 
-  logger.info('Launching Chrome directly', { chromePath, cdpPort, headless });
+  logger.info('Launching Chrome directly', { chromePath, cdpPort, headless, mode });
 
-  const chromeProcess = spawn(chromePath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // stdio ignored: unread pipes can fill up and stall Chrome
+  spawn(chromePath, args, { stdio: 'ignore' });
 
   const cdpUrl = `http://127.0.0.1:${cdpPort}`;
   let attempts = 0;
@@ -167,7 +188,6 @@ export async function launchChromeDirect(options = {}) {
   context = browser.contexts()[0];
   page = context.pages()[0] || await context.newPage();
   isConnected = true;
-  global.__chromeTempDir = tempDir;
 
   logger.info('Chrome direct + CDP connected', { webdriver: await page.evaluate(() => navigator.webdriver) });
   return { browser, context, page };

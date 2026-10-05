@@ -5,8 +5,8 @@ import { logger } from '../utils/logger.js';
 import { get } from '../utils/config.js';
 import { FlowError, ErrorCodes } from '../utils/errors.js';
 import { launchChromeDirect, setPage, setContext, setConnected, setBrowser, isBrowserConnected } from './connect.js';
+import { findChromePath, getProfileSource, getProfileMode } from './chrome-paths.js';
 
-const CHROME_PATH = '/opt/google/chrome/chrome';
 const CDP_PORT = get('cdpPort', 9222);
 const FLOW_URL = get('flowUrl', 'https://labs.google/fx/fr/tools/flow');
 
@@ -16,14 +16,15 @@ export async function launchKiaraProfile(headless = false) {
     return { success: true, message: 'Already connected' };
   }
 
-  const profileSource = path.resolve(process.env.HOME, '.config/google-chrome/Profile 3');
+  const mode = getProfileMode();
+  const profileSource = getProfileSource();
 
-  if (!fs.existsSync(profileSource)) {
+  if (mode === 'copy' && !fs.existsSync(profileSource)) {
     throw new FlowError(ErrorCodes.CONFIG_ERROR,
-      `Profile 3 not found at ${profileSource}. Make sure Chrome Profile 3 exists and is configured with your Google account.`);
+      `Chrome profile not found at ${profileSource}. Check "chromeUserDataDir" and "chromeProfile" in config/flow.config.json.`);
   }
 
-  logger.info('Launching Chrome via direct+CDP method (anti-detection)', { profileSource });
+  logger.info('Launching Chrome via direct+CDP method (anti-detection)', { mode, profileSource });
 
   try {
     // Try connecting to existing Chrome instance first
@@ -41,18 +42,17 @@ export async function launchKiaraProfile(headless = false) {
   } catch {
     // Launch Chrome directly (not via Playwright) for anti-detection
     return await launchChromeDirect({
-      chromePath: CHROME_PATH,
+      chromePath: findChromePath(),
       cdpPort: CDP_PORT,
       headless,
       profileSource,
+      profileMode: mode,
     });
   }
 }
 
 export async function navigateToFlow(page, toolPage) {
-  const targetUrl = toolPage === true
-    ? 'https://labs.google/fx/fr/tools/flow'
-    : FLOW_URL;
+  const targetUrl = FLOW_URL;
 
   logger.info('Navigating to Google Flow', { url: targetUrl });
   await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
